@@ -2,6 +2,7 @@
  * See LICENSE file for copyright and license details.
  */
 #define _POSIX_C_SOURCE 200112L
+#include <assert.h>
 #include <getopt.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -33,6 +34,11 @@
 #include <xkbcommon/xkbcommon.h>
 
 /* macros */
+#define IMP(P, Q)               (!(P) || (Q))
+#define EQV(P, Q)               (!(P) == !(Q))
+#define SAME_CLIENT(A, B)       ((A) && (B) && wl_resource_get_client((A)->resource) == wl_resource_get_client((B)->resource))
+#define KBFOCUS_IS(C)           (SAME_CLIENT(seat->keyboard_state.focused_surface, (C)->xdg_surface->surface))
+#define PTRFOCUS_IS(C)          (SAME_CLIENT(seat->pointer_state.focused_surface, (C)->xdg_surface->surface))
 #define MAX(A, B)               ((A) > (B) ? (A) : (B))
 #define MIN(A, B)               ((A) < (B) ? (A) : (B))
 #define CLEANMASK(mask)         (mask & ~WLR_MODIFIER_CAPS)
@@ -219,6 +225,35 @@ static Monitor *selmon;
 /* configuration, allows nested code to access above variables */
 #include "config.h"
 
+static void
+assert_keyboard_focus_invariants(void)
+{
+	Client *sel = selclient();
+	/* Selected client is visible on selmon */
+	assert(IMP(sel != NULL, VISIBLEON(sel, selmon)));
+	/* Selected client is top of focus stack */
+	assert(IMP(sel != NULL, sel->flink.prev == &fstack));
+	/* Selected client has keyboard focus */
+	assert(IMP(sel != NULL, KBFOCUS_IS(sel)));
+	/* Selected client's toplevel is activated */
+	assert(IMP(sel != NULL, sel->xdg_surface->toplevel->server_pending.activated));
+}
+
+static void
+assert_pointer_focus_invariants(void)
+{
+	struct wlr_surface *surface = NULL;
+	double sx, sy;
+	xytoclient(cursor->x, cursor->y, &surface, &sx, &sy);
+	if (cursor_mode == CurNormal) {
+		/* Pointer focus is surface under pointer */
+		assert(wlr_seat_pointer_surface_has_focus(seat, surface));
+	} else {
+		/* No surface has pointer focus */
+		assert(wlr_seat_pointer_surface_has_focus(seat, NULL));
+	}
+}
+
 void
 arrange(Monitor *m)
 {
@@ -248,18 +283,37 @@ chvt(const Arg *arg)
 	wlr_session_change_vt(s, arg->ui);
 }
 
-void
-buttonpress(struct wl_listener *listener, void *data)
+static void
+_buttonpress(struct wl_listener *listener, void *data)
 {
 	/* This event is forwarded by the cursor when a pointer emits a button
 	 * event. */
 	struct wlr_event_pointer_button *event = data;
-	/* Notify the client with pointer focus that a button press has occurred */
-	/* XXX probably don't want to pass the event if it's handled by the
-	 * compositor at the bottom of this function */
-	wlr_seat_pointer_notify_button(seat,
-			event->time_msec, event->button, event->state);
-	if (event->state == WLR_BUTTON_RELEASED) {
+	bool handled = false;
+	switch (event->state) {
+	case WLR_BUTTON_PRESSED:
+	{
+		/* Change focus if the button was pressed over a client */
+		double sx, sy;
+		struct wlr_surface *surface;
+		Client *c = xytoclient(cursor->x, cursor->y, &surface, &sx, &sy);
+		if (c) {
+			keyboardfocus(c, surface);
+			raiseclient(c);
+		}
+
+		struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+		uint32_t mods = wlr_keyboard_get_modifiers(keyboard);
+		for (int i = 0; i < LENGTH(buttons); i++)
+			if (event->button == buttons[i].button &&
+					CLEANMASK(mods) == CLEANMASK(buttons[i].mod) &&
+					buttons[i].func) {
+				buttons[i].func(&buttons[i].arg);
+				handled = true;
+			}
+		break;
+	}
+	case WLR_BUTTON_RELEASED:
 		/* If you released any buttons, we exit interactive move/resize mode. */
 		/* XXX should reset to the pointer focus's current setcursor */
 		if (cursor_mode != CurNormal) {
@@ -267,26 +321,36 @@ buttonpress(struct wl_listener *listener, void *data)
 			wlr_xcursor_manager_set_cursor_image(cursor_mgr,
 					"left_ptr", cursor);
 			pointerrefocus();
+			handled = true;
 		}
-		return;
+		break;
 	}
 
-	/* Change focus if the button was _pressed_ over a client */
-	double sx, sy;
-	struct wlr_surface *surface;
-	Client *c = xytoclient(cursor->x, cursor->y, &surface, &sx, &sy);
-	if (c) {
-		keyboardfocus(c, surface);
-		raiseclient(c);
+	if (!handled) {
+		/* Notify the client with pointer focus that a button press has
+		 * occurred */
+		wlr_seat_pointer_notify_button(seat,
+				event->time_msec, event->button, event->state);
 	}
+}
 
-	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-	uint32_t mods = wlr_keyboard_get_modifiers(keyboard);
-	for (int i = 0; i < LENGTH(buttons); i++)
-		if (event->button == buttons[i].button &&
-				CLEANMASK(mods) == CLEANMASK(buttons[i].mod) &&
-				buttons[i].func)
-			buttons[i].func(&buttons[i].arg);
+void
+buttonpress(struct wl_listener *listener, void *data)
+{
+	struct wlr_event_pointer_button *event = data;
+	_buttonpress(listener, data);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
+	if (event->state == WLR_BUTTON_PRESSED) {
+		struct wlr_surface *surface = NULL;
+		double sx, sy;
+		xytoclient(cursor->x, cursor->y, &surface, &sx, &sy);
+		if (surface) {
+			/* Postcondition: clicked client now on top of stacking order */
+			Client *top = wl_container_of(stack.next, top, slink);
+			assert(SAME_CLIENT(surface, top->xdg_surface->surface));
+		}
+	}
 }
 
 void
@@ -384,6 +448,9 @@ createnotify(struct wl_listener *listener, void *data)
 	Client *c = calloc(1, sizeof(*c));
 	c->xdg_surface = xdg_surface;
 	c->bw = borderpx;
+	pid_t pid;
+	wl_client_get_credentials(xdg_surface->client->client, &pid, NULL, NULL);
+	wlr_log(WLR_INFO, "new client for pid %d", pid);
 
 	/* Tell the client not to try anything fancy */
 	wlr_xdg_toplevel_set_tiled(c->xdg_surface, true);
@@ -418,16 +485,26 @@ cursorframe(struct wl_listener *listener, void *data)
 	wlr_seat_pointer_notify_frame(seat);
 }
 
-void
-destroynotify(struct wl_listener *listener, void *data)
+static void
+_destroynotify(struct wl_listener *listener, void *data)
 {
 	/* Called when the surface is destroyed and should never be shown again. */
 	Client *c = wl_container_of(listener, c, destroy);
 	free(c);
 }
 
-Monitor *
-dirtomon(int dir)
+void
+destroynotify(struct wl_listener *listener, void *data)
+{
+	/* XXX not yet
+	Client *c = wl_container_of(listener, c, destroy);
+	assert(c->mon == NULL);
+	*/
+	_destroynotify(listener, data);
+}
+
+static Monitor *
+_dirtomon(int dir)
 {
 	Monitor *m;
 
@@ -442,8 +519,21 @@ dirtomon(int dir)
 	}
 }
 
-void
-focusmon(const Arg *arg)
+Monitor *
+dirtomon(int dir)
+{
+	/* Precondition */
+	assert(selmon != NULL);
+	Monitor *ret = _dirtomon(dir);
+	assert(ret != NULL);
+	/* Postcondition: cannot return bogus "monitor" that contains the
+	 * sentinel node */
+	assert(&ret->link != &mons);
+	return ret;
+}
+
+static void
+_focusmon(const Arg *arg)
 {
 	Monitor *m = dirtomon(arg->i);
 
@@ -454,7 +544,20 @@ focusmon(const Arg *arg)
 }
 
 void
-focusstack(const Arg *arg)
+focusmon(const Arg *arg)
+{
+	assert(selmon != NULL);
+	_focusmon(arg);
+	assert(selmon != NULL);
+	Client *sel = selclient();
+	/* Postcondition: selected client is visible on selmon */
+	assert(IMP(sel != NULL, VISIBLEON(sel, selmon)));
+	/* Postcondition: selected client is top of focus stack */
+	assert(IMP(sel != NULL, sel->flink.prev == &fstack));
+}
+
+static void
+_focusstack(const Arg *arg)
 {
 	/* Focus the next or previous client (in tiling order) on selmon */
 	Client *sel = selclient();
@@ -482,9 +585,26 @@ focusstack(const Arg *arg)
 }
 
 void
-incnmaster(const Arg *arg)
+focusstack(const Arg *arg)
+{
+	Monitor *oldselmon = selmon;
+	_focusstack(arg);
+	assert(oldselmon == selmon);
+	assert_keyboard_focus_invariants();
+}
+
+static void
+_incnmaster(const Arg *arg)
 {
 	selmon->nmaster = MAX(selmon->nmaster + arg->i, 0);
+}
+
+void
+incnmaster(const Arg *arg)
+{
+	assert(selmon != NULL);
+	_incnmaster(arg);
+	assert(selmon->nmaster >= 0);
 }
 
 void
@@ -533,8 +653,8 @@ keybinding(uint32_t mods, xkb_keysym_t sym)
 	return handled;
 }
 
-void
-keyboardfocus(Client *c, struct wlr_surface *surface)
+static void
+_keyboardfocus(Client *c, struct wlr_surface *surface)
 {
 	if (c) {
 		/* assert(VISIBLEON(c, c->mon)); ? */
@@ -577,6 +697,15 @@ keyboardfocus(Client *c, struct wlr_surface *surface)
 		/* Activate the new surface */
 		wlr_xdg_toplevel_set_activated(c->xdg_surface, true);
 	}
+}
+
+void
+keyboardfocus(Client *c, struct wlr_surface *surface)
+{
+	/* XXX EQV? */
+	assert(IMP(c == NULL, surface == NULL));
+	_keyboardfocus(c, surface);
+	assert_keyboard_focus_invariants();
 }
 
 void
@@ -626,8 +755,8 @@ keypressmod(struct wl_listener *listener, void *data)
 		&kb->device->keyboard->modifiers);
 }
 
-void
-maprequest(struct wl_listener *listener, void *data)
+static void
+_maprequest(struct wl_listener *listener, void *data)
 {
 	/* Called when the surface is mapped, or ready to display on-screen. */
 	Client *c = wl_container_of(listener, c, map);
@@ -638,9 +767,20 @@ maprequest(struct wl_listener *listener, void *data)
 	wl_list_insert(&clients, &c->link);
 	wl_list_insert(&fstack, &c->flink);
 	wl_list_insert(&stack, &c->slink);
+	/* New client is visible, maybe focus it */
+	/* XXX think about focus-stealing here... */
 	/* XXX should check all outputs, also needs a send_leave counterpart */
 	wlr_surface_send_enter(c->xdg_surface->surface, c->mon->wlr_output);
 	keyboardfocus(c, NULL);
+	arrange(c->mon);
+}
+
+void
+maprequest(struct wl_listener *listener, void *data)
+{
+	_maprequest(listener, data);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
 }
 
 void
@@ -657,8 +797,8 @@ motionabsolute(struct wl_listener *listener, void *data)
 	motionnotify(event->time_msec);
 }
 
-void
-motionnotify(uint32_t time)
+static void
+_motionnotify(uint32_t time)
 {
 	/* Update selmon (even while dragging a window) */
 	if (sloppyfocus)
@@ -702,6 +842,13 @@ motionnotify(uint32_t time)
 }
 
 void
+motionnotify(uint32_t time)
+{
+	_motionnotify(time);
+	assert_pointer_focus_invariants();
+}
+
+void
 motionrelative(struct wl_listener *listener, void *data)
 {
 	/* This event is forwarded by the cursor when a pointer emits a _relative_
@@ -730,10 +877,13 @@ movemouse(const Arg *arg)
 		setfloating(grabc, 1);
 	cursor_mode = CurMove;
 	wlr_xcursor_manager_set_cursor_image(cursor_mgr, "fleur", cursor);
+
+	/* "Grab" the pointer focus until we finish the drag */
+	wlr_seat_pointer_clear_focus(seat);
 }
 
-void
-pointerfocus(Client *c, struct wlr_surface *surface, double sx, double sy)
+static void
+_pointerfocus(Client *c, struct wlr_surface *surface, double sx, double sy)
 {
 	/* If surface is NULL, clear pointer focus, otherwise let the client
 	 * know that the mouse cursor has entered one of its surfaces. */
@@ -745,6 +895,15 @@ pointerfocus(Client *c, struct wlr_surface *surface, double sx, double sy)
 	/* If keyboard focus follows mouse, enforce that */
 	if (sloppyfocus && c)
 		keyboardfocus(c, surface);
+}
+
+void
+pointerfocus(Client *c, struct wlr_surface *surface, double sx, double sy)
+{
+	assert(EQV(c == NULL, surface == NULL));
+	_pointerfocus(c, surface, sx, sy);
+	assert_pointer_focus_invariants();
+	assert_keyboard_focus_invariants();
 }
 
 void
@@ -765,8 +924,8 @@ quit(const Arg *arg)
 	wl_display_terminate(dpy);
 }
 
-void
-refocus(void)
+static void
+_refocus(void)
 {
 	Client *c = NULL, *next;
 	wl_list_for_each(next, &fstack, flink) {
@@ -776,7 +935,17 @@ refocus(void)
 		}
 	}
 	/* XXX consider: should this ever? always? raise the client? */
+	assert(IMP(c != NULL, c->mon == selmon));
 	keyboardfocus(c, NULL);
+}
+
+void
+refocus(void)
+{
+	Monitor *oldselmon = selmon;
+	_refocus();
+	assert(oldselmon == selmon);
+	assert_keyboard_focus_invariants();
 }
 
 void
@@ -912,8 +1081,6 @@ rendermon(struct wl_listener *listener, void *data)
 	m->ww = m->geom->width;
 	m->wh = m->geom->height;
 
-	arrange(m);
-
 	/* Begin the renderer (calls glViewport and some other GL sanity checks) */
 	wlr_renderer_begin(drw, m->wlr_output->width, m->wlr_output->height);
 	wlr_renderer_clear(drw, rootcolor);
@@ -964,6 +1131,11 @@ resizemouse(const Arg *arg)
 	cursor_mode = CurResize;
 	wlr_xcursor_manager_set_cursor_image(cursor_mgr,
 			"bottom_right_corner", cursor);
+	resize(grabc, grabc->x, grabc->y,
+			cursor->x - grabc->x, cursor->y - grabc->y);
+
+	/* "Grab" the pointer focus until we finish the drag */
+	wlr_seat_pointer_clear_focus(seat);
 }
 
 void
@@ -1046,11 +1218,12 @@ selclient(void)
 	return c;
 }
 
-void
-sendmon(Client *c, Monitor *m)
+static void
+_sendmon(Client *c, Monitor *m)
 {
 	if (c->mon == m)
 		return;
+	Monitor *oldmon = c->mon;
 	c->mon = m;
 	/* XXX should check all outputs, also needs a send_leave counterpart */
 	wlr_surface_send_enter(c->xdg_surface->surface, c->mon->wlr_output);
@@ -1058,6 +1231,19 @@ sendmon(Client *c, Monitor *m)
 
 	if (c == selclient())
 		refocus();
+	arrange(c->mon);
+	arrange(oldmon);
+}
+
+void
+sendmon(Client *c, Monitor *m)
+{
+	Monitor *oldselmon = selmon;
+	_sendmon(c, m);
+	assert(c->mon == m);
+	assert(oldselmon == selmon);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
 }
 
 void
@@ -1079,14 +1265,24 @@ setcursor(struct wl_listener *listener, void *data)
 				event->hotspot_x, event->hotspot_y);
 }
 
-void
-setlayout(const Arg *arg)
+static void
+_setlayout(const Arg *arg)
 {
 	if (!arg || !arg->v || arg->v != selmon->lt[selmon->sellt])
 		selmon->sellt ^= 1;
 	if (arg && arg->v)
 		selmon->lt[selmon->sellt] = (Layout *)arg->v;
 	/* XXX change layout symbol? */
+}
+
+void
+setlayout(const Arg *arg)
+{
+	Monitor *oldselmon = selmon;
+	_setlayout(arg);
+	assert(oldselmon == selmon);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
 }
 
 /* arg > 1.0 will set mfact absolutely */
@@ -1234,23 +1430,44 @@ spawn(const Arg *arg)
 	}
 }
 
-void
-tag(const Arg *arg)
+static void
+_tag(const Arg *arg)
 {
 	Client *sel = selclient();
 	if (sel && arg->ui & TAGMASK) {
 		sel->tags = arg->ui & TAGMASK;
 		refocus();
+		arrange(selmon);
 	}
 }
 
 void
-tagmon(const Arg *arg)
+tag(const Arg *arg)
+{
+	Monitor *oldselmon = selmon;
+	_tag(arg);
+	assert(oldselmon == selmon);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
+}
+
+static void
+_tagmon(const Arg *arg)
 {
 	Client *sel = selclient();
 	if (!sel)
 		return;
 	sendmon(sel, dirtomon(arg->i));
+}
+
+void
+tagmon(const Arg *arg)
+{
+	Monitor *oldselmon = selmon;
+	_tagmon(arg);
+	assert(oldselmon == selmon);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
 }
 
 void
@@ -1289,8 +1506,8 @@ tile(Monitor *m)
 	}
 }
 
-void
-setfloating(Client *c, int floating)
+static void
+_setfloating(Client *c, int floating)
 {
 	if (c->isfloating == floating)
 		return;
@@ -1299,7 +1516,15 @@ setfloating(Client *c, int floating)
 }
 
 void
-togglefloating(const Arg *arg)
+setfloating(Client *c, int floating)
+{
+	_setfloating(c, floating);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
+}
+
+static void
+_togglefloating(const Arg *arg)
 {
 	Client *c = selclient();
 	if (!c)
@@ -1309,7 +1534,15 @@ togglefloating(const Arg *arg)
 }
 
 void
-toggletag(const Arg *arg)
+togglefloating(const Arg *arg)
+{
+	_togglefloating(arg);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
+}
+
+static void
+_toggletag(const Arg *arg)
 {
 	unsigned int newtags;
 	Client *sel = selclient();
@@ -1323,7 +1556,15 @@ toggletag(const Arg *arg)
 }
 
 void
-toggleview(const Arg *arg)
+toggletag(const Arg *arg)
+{
+	_toggletag(arg);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
+}
+
+static void
+_toggleview(const Arg *arg)
 {
 	unsigned int newtagset = selmon->tagset[selmon->seltags] ^ (arg->ui & TAGMASK);
 
@@ -1331,6 +1572,14 @@ toggleview(const Arg *arg)
 		selmon->tagset[selmon->seltags] = newtagset;
 		refocus();
 	}
+}
+
+void
+toggleview(const Arg *arg)
+{
+	_toggleview(arg);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
 }
 
 void
@@ -1345,10 +1594,12 @@ unmapnotify(struct wl_listener *listener, void *data)
 
 	if (hadfocus)
 		refocus();
+	if (VISIBLEON(c, c->mon))
+		arrange(c->mon);
 }
 
-void
-view(const Arg *arg)
+static void
+_view(const Arg *arg)
 {
 	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
 		return;
@@ -1356,6 +1607,17 @@ view(const Arg *arg)
 	if (arg->ui & TAGMASK)
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
 	refocus();
+	arrange(selmon);
+}
+
+void
+view(const Arg *arg)
+{
+	Monitor *oldselmon = selmon;
+	_view(arg);
+	assert(oldselmon == selmon);
+	assert_keyboard_focus_invariants();
+	assert_pointer_focus_invariants();
 }
 
 Client *
@@ -1407,7 +1669,7 @@ xytomon(double x, double y)
 int
 main(int argc, char *argv[])
 {
-	wlr_log_init(WLR_DEBUG, NULL);
+	wlr_log_init(WLR_INFO, NULL);
 	char *startup_cmd = NULL;
 
 	int c;
