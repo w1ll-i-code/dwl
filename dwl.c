@@ -13,6 +13,9 @@
 #include <linux/input-event-codes.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/backend/x11.h>
+#include <wlr/backend/multi.h>
+#include <wlr/backend/wayland.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
@@ -1101,6 +1104,15 @@ setmfact(const Arg *arg)
 	selmon->mfact = f;
 }
 
+static void
+add_x11_output(struct wlr_backend *sub, void *data)
+{
+	if (wlr_backend_is_x11(sub)) {
+		wlr_log(WLR_INFO, "multi: x11 backend");
+		wlr_x11_output_create(sub);
+	}
+}
+
 void
 setup(void)
 {
@@ -1113,6 +1125,14 @@ setup(void)
 	 * if the backend does not support hardware cursors (some older GPUs
 	 * don't). */
 	backend = wlr_backend_autocreate(dpy, NULL);
+
+	if (wlr_backend_is_x11(backend)) {
+		wlr_log(WLR_INFO, "x11 backend");
+		wlr_x11_output_create(backend);
+	} else if (wlr_backend_is_multi(backend)) {
+		wlr_log(WLR_INFO, "multi backend");
+		wlr_multi_for_each_backend(backend, add_x11_output, NULL);
+	}
 
 	/* If we don't provide a renderer, autocreate makes a GLES2 renderer for us.
 	 * The renderer is responsible for defining the various pixel formats it
