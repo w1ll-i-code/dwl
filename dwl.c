@@ -247,6 +247,7 @@ assert_pointer_focus_invariants(void)
 	xytoclient(cursor->x, cursor->y, &surface, &sx, &sy);
 	if (cursor_mode == CurNormal) {
 		/* Pointer focus is surface under pointer */
+		/* XXX fails when popups are created under pointer */
 		assert(wlr_seat_pointer_surface_has_focus(seat, surface));
 	} else {
 		/* No surface has pointer focus */
@@ -1620,8 +1621,8 @@ view(const Arg *arg)
 	assert_pointer_focus_invariants();
 }
 
-Client *
-xytoclient(double x, double y,
+static Client *
+_xytoclient(double x, double y,
 		struct wlr_surface **surface, double *sx, double *sy)
 {
 	/* XXX what if (x,y) is within a window's border? */
@@ -1653,6 +1654,18 @@ xytoclient(double x, double y,
 		}
 	}
 	return NULL;
+}
+
+Client *
+xytoclient(double x, double y,
+		struct wlr_surface **surface, double *sx, double *sy)
+{
+	assert(surface != NULL);
+	assert(sx != NULL);
+	assert(sy != NULL);
+	Client *ret = _xytoclient(x, y, surface, sx, sy);
+	assert(EQV(ret != NULL, *surface != NULL));
+	return ret;
 }
 
 Monitor *
