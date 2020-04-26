@@ -150,6 +150,7 @@ static void motionrelative(struct wl_listener *listener, void *data);
 static void movemouse(const Arg *arg);
 static void pointerfocus(Client *c, struct wlr_surface *surface,
 		double sx, double sy);
+static void pointerrefocus(void);
 static void quit(const Arg *arg);
 static void raiseclient(Client *c);
 static void refocus(void);
@@ -219,7 +220,7 @@ arrange(Monitor *m)
 {
 	if (m->lt[m->sellt]->arrange)
 		m->lt[m->sellt]->arrange(m);
-	/* XXX recheck pointer focus here... or in resize()? */
+	pointerrefocus();
 }
 
 void
@@ -257,10 +258,12 @@ buttonpress(struct wl_listener *listener, void *data)
 	if (event->state == WLR_BUTTON_RELEASED) {
 		/* If you released any buttons, we exit interactive move/resize mode. */
 		/* XXX should reset to the pointer focus's current setcursor */
-		if (cursor_mode != CurNormal)
+		if (cursor_mode != CurNormal) {
+			cursor_mode = CurNormal;
 			wlr_xcursor_manager_set_cursor_image(cursor_mgr,
 					"left_ptr", cursor);
-		cursor_mode = CurNormal;
+			pointerrefocus();
+		}
 		return;
 	}
 
@@ -740,6 +743,18 @@ pointerfocus(Client *c, struct wlr_surface *surface, double sx, double sy)
 	/* If keyboard focus follows mouse, enforce that */
 	if (sloppyfocus)
 		keyboardfocus(c, surface);
+}
+
+void
+pointerrefocus(void)
+{
+	/* Don't change pointer focus if grabbed by compositor */
+	if (cursor_mode != CurNormal)
+		return;
+	struct wlr_surface *surface = NULL;
+	double sx, sy;
+	Client *c = xytoclient(cursor->x, cursor->y, &surface, &sx, &sy);
+	pointerfocus(c, surface, sx, sy);
 }
 
 void
