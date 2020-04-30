@@ -1,7 +1,11 @@
 /* appearance */
-static const int sloppyfocus        = 1;  /* focus follows mouse */
-static const unsigned int borderpx  = 1;  /* border pixel of windows */
-static const float rootcolor[]      = {0.3, 0.3, 0.3, 1.0};
+static const int sloppyfocus        = 1;        /* focus follows mouse */
+static const unsigned int borderpx  = 1;        /* border pixel of windows */
+static const unsigned int topgap    = 22;       /* gap at top of screen */
+static const char menufont[]        = "Fantasque Sans Mono 13";
+static const char normfgcolor[]     = "#babdb6";
+static const char normbgcolor[]     = "#000000";
+static const float rootcolor[]      = {0.1, 0.1, 0.3, 1.0};
 static const float bordercolor[]    = {0.5, 0.5, 0.5, 1.0};
 
 /* tagging */
@@ -40,10 +44,13 @@ static const struct xkb_rule_names xkb_rules = {
 	{ MODKEY|WLR_MODIFIER_CTRL|WLR_MODIFIER_SHIFT,SKEY,toggletag, {.ui = 1 << TAG} }
 
 /* commands */
+static char menumon[2] = "0"; /* component of menucmd, manipulated in spawn() */
+static const char *menucmd[] = { "bemenu-run", "-p", "", "-m", menumon, "--fn", menufont, "--nb", normbgcolor, "--nf", normfgcolor, "--hb", normfgcolor, "--hf", normbgcolor, NULL };
 static const char *termcmd[]  = { "kitty", "-o", "linux_display_server=wayland", NULL };
 
 static const Key keys[] = {
 	/* modifier                  key                 function        argument */
+	{ MODKEY,                    XKB_KEY_p,          spawn,          {.v = menucmd} },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Return,     spawn,          {.v = termcmd} },
 	{ MODKEY,                    XKB_KEY_j,          focusstack,     {.i = +1} },
 	{ MODKEY,                    XKB_KEY_k,          focusstack,     {.i = -1} },
