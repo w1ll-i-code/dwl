@@ -129,6 +129,7 @@ static void arrange(Monitor *m);
 static void axisnotify(struct wl_listener *listener, void *data);
 static void buttonpress(struct wl_listener *listener, void *data);
 static void chvt(const Arg *arg);
+static void cleanup(void);
 static void createkeyboard(struct wlr_input_device *device);
 static void createmon(struct wl_listener *listener, void *data);
 static void createnotify(struct wl_listener *listener, void *data);
@@ -148,7 +149,7 @@ static void maprequest(struct wl_listener *listener, void *data);
 static void motionabsolute(struct wl_listener *listener, void *data);
 static void motionnotify(uint32_t time);
 static void motionrelative(struct wl_listener *listener, void *data);
-static void movemouse(const Arg *arg);
+static void moveresize(const Arg *arg);
 static void pointerfocus(Client *c, struct wlr_surface *surface,
 		double sx, double sy, uint32_t time);
 static void quit(const Arg *arg);
@@ -157,7 +158,6 @@ static void render(struct wlr_surface *surface, int sx, int sy, void *data);
 static void renderclients(Monitor *m, struct timespec *now);
 static void rendermon(struct wl_listener *listener, void *data);
 static void resize(Client *c, int x, int y, int w, int h, int interact);
-static void resizemouse(const Arg *arg);
 static void run(char *startup_cmd);
 static void scalebox(struct wlr_box *box, float scale);
 static Client *selclient(void);
@@ -205,7 +205,7 @@ static struct wl_listener request_cursor;
 static struct wl_list keyboards;
 static unsigned int cursor_mode;
 static Client *grabc;
-static double grabsx, grabsy; /* surface-relative */
+static double grabcx, grabcy; /* surface-relative */
 
 static struct wlr_output_layout *output_layout;
 static struct wlr_box sgeom;
@@ -306,6 +306,28 @@ buttonpress(struct wl_listener *listener, void *data)
 	 * pointer focus that a button press has occurred */
 	wlr_seat_pointer_notify_button(seat,
 			event->time_msec, event->button, event->state);
+}
+
+void
+cleanup(void)
+{
+	wl_display_destroy_clients(dpy);
+	/* XXX handle destroy events */
+	Keyboard *kb, *tmp;
+	wl_list_for_each_safe(kb, tmp, &keyboards, link) {
+		wl_list_remove(&kb->link);
+		free(kb);
+	}
+	Monitor *m, *mtmp;
+	wl_list_for_each_safe(m, mtmp, &mons, link) {
+		wl_list_remove(&m->link);
+		free(m);
+	}
+	wlr_xcursor_manager_destroy(cursor_mgr);
+	wlr_cursor_destroy(cursor);
+	wlr_output_layout_destroy(output_layout);
+	//wlr_renderer_destroy(drw);
+	wlr_backend_destroy(backend);
 }
 
 void
@@ -466,7 +488,7 @@ focusclient(Client *c, struct wlr_surface *surface, int lift)
 {
 	if (c) {
 		/* assert(VISIBLEON(c, c->mon)); ? */
-		/* If no surface provided, use the client's xdg_surface */
+		/* Use top level surface if nothing more specific given */
 		if (!surface)
 			surface = c->xdg_surface->surface;
 		/* Focus the correct monitor as well */
@@ -691,8 +713,7 @@ motionnotify(uint32_t time)
 	if (cursor_mode == CurMove) {
 		/* Move the grabbed client to the new position. */
 		/* XXX assumes the surface is at (0,0) within grabc */
-		resize(grabc, cursor->x - grabsx - grabc->bw,
-				cursor->y - grabsy - grabc->bw,
+		resize(grabc, cursor->x - grabcx, cursor->y - grabcy,
 				grabc->geom.width, grabc->geom.height, 1);
 		return;
 	} else if (cursor_mode == CurResize) {
@@ -733,23 +754,40 @@ motionrelative(struct wl_listener *listener, void *data)
 }
 
 void
-movemouse(const Arg *arg)
+moveresize(const Arg *arg)
 {
 	struct wlr_surface *surface;
-	grabc = xytoclient(cursor->x, cursor->y, &surface, &grabsx, &grabsy);
+	double sx, sy;
+	grabc = xytoclient(cursor->x, cursor->y, &surface, &sx, &sy);
 	if (!grabc)
 		return;
 
 	/* Float the window and tell motionnotify to grab it */
 	setfloating(grabc, 1);
-	cursor_mode = CurMove;
-	wlr_xcursor_manager_set_cursor_image(cursor_mgr, "fleur", cursor);
+	switch (cursor_mode = arg->ui) {
+	case CurMove:
+		grabcx = cursor->x - grabc->geom.x;
+		grabcy = cursor->y - grabc->geom.y;
+		wlr_xcursor_manager_set_cursor_image(cursor_mgr, "fleur", cursor);
+		break;
+	case CurResize:
+		/* Doesn't work for X11 output - the next absolute motion event
+		 * returns the cursor to where it started */
+		wlr_cursor_warp_closest(cursor, NULL,
+				grabc->geom.x + grabc->geom.width,
+				grabc->geom.y + grabc->geom.height);
+		wlr_xcursor_manager_set_cursor_image(cursor_mgr,
+				"bottom_right_corner", cursor);
+		break;
+	}
 }
 
 void
 pointerfocus(Client *c, struct wlr_surface *surface, double sx, double sy,
 		uint32_t time)
 {
+	if (c && !surface)
+		surface = c->xdg_surface->surface;
 	/* If surface is already focused, only notify of motion */
 	if (surface && surface == seat->pointer_state.focused_surface) {
 		wlr_seat_pointer_notify_motion(seat, time, sx, sy);
@@ -937,27 +975,6 @@ resize(Client *c, int x, int y, int w, int h, int interact)
 	/* wlroots makes this a no-op if size hasn't changed */
 	wlr_xdg_toplevel_set_size(c->xdg_surface,
 			c->geom.width - 2 * c->bw, c->geom.height - 2 * c->bw);
-}
-
-void
-resizemouse(const Arg *arg)
-{
-	struct wlr_surface *surface;
-	grabc = xytoclient(cursor->x, cursor->y, &surface, &grabsx, &grabsy);
-	if (!grabc)
-		return;
-
-	/* Doesn't work for X11 output - the next absolute motion event
-	 * returns the cursor to where it started */
-	wlr_cursor_warp_closest(cursor, NULL,
-			grabc->geom.x + grabc->geom.width,
-			grabc->geom.y + grabc->geom.height);
-
-	/* Float the window and tell motionnotify to resize it */
-	setfloating(grabc, 1);
-	cursor_mode = CurResize;
-	wlr_xcursor_manager_set_cursor_image(cursor_mgr,
-			"bottom_right_corner", cursor);
 }
 
 void
@@ -1179,7 +1196,9 @@ setup(void)
 	/* Creates an xcursor manager, another wlroots utility which loads up
 	 * Xcursor themes to source cursor images from and makes sure that cursor
 	 * images are available at all scale factors on the screen (necessary for
-	 * HiDPI support). Scaled cursors will be loaded with each output. */
+	 * HiDPI support). We will load appropriately scaled cursor themes as
+	 * outputs appear.
+	 */
 	cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
 
 	/*
@@ -1359,24 +1378,20 @@ xytoclient(double x, double y,
 		/* Skip clients that aren't visible */
 		if (!VISIBLEON(c, c->mon))
 			continue;
-		/*
-		 * XDG toplevels may have nested surfaces, such as popup windows
-		 * for context menus or tooltips. This function tests if any of
-		 * those are underneath the coordinates x and y (in layout
-		 * coordinates). If so, it sets the surface pointer to that
-		 * wlr_surface and the sx and sy coordinates to the coordinates
-		 * relative to that surface's top-left corner.
-		 */
-		double _sx, _sy;
-		struct wlr_surface *_surface = NULL;
-		_surface = wlr_xdg_surface_surface_at(c->xdg_surface,
+		if (wlr_box_contains_point(&c->geom, x, y)) {
+			/*
+			 * XDG toplevels may have nested surfaces, such as popup windows
+			 * for context menus or tooltips. This function tests if any of
+			 * those are underneath the coordinates x and y (in layout
+			 * coordinates). If so, it sets the surface pointer to that
+			 * wlr_surface and the sx and sy coordinates to the coordinates
+			 * relative to that surface's top-left corner.
+			 */
+			/* XXX return xdg_surface->surface instead of NULL?  what
+			 * should sx/sy be in that case? */
+			*surface = wlr_xdg_surface_surface_at(c->xdg_surface,
 				x - c->geom.x - c->bw, y - c->geom.y - c->bw,
-				&_sx, &_sy);
-
-		if (_surface) {
-			*sx = _sx;
-			*sy = _sy;
-			*surface = _surface;
+				sx, sy);
 			return c;
 		}
 	}
@@ -1428,9 +1443,9 @@ main(int argc, char *argv[])
 
 	setup();
 	run(startup_cmd);
+	cleanup();
 
 	/* Once wl_display_run returns, we shut down the server. */
-	wl_display_destroy_clients(dpy);
 	wl_display_destroy(dpy);
 	return EXIT_SUCCESS;
 }
