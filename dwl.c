@@ -1806,7 +1806,10 @@ resize(Client *c, int x, int y, int w, int h, int interact)
 void
 run(char *startup_cmd)
 {
+	int cmdc = 0;
+	pid_t *startup_pids = NULL;
 	pid_t startup_pid = -1;
+
 
 	/* Add a Unix socket to the Wayland display. */
 	const char *socket = wl_display_add_socket_auto(dpy);
@@ -1814,8 +1817,23 @@ run(char *startup_cmd)
 		BARF("startup: display_add_socket_auto");
 	setenv("WAYLAND_DISPLAY", socket, 1);
 
-	/* Now that the socket exists, run the startup command */
+	/* Now that the socket exists, run the startup commands */
+	while(startup_cmds[cmdc]) {
+		cmdc++; // count the commands, so that we can allocate memory for the pids
+	}
+
 	if (startup_cmd) {
+		startup_cmds[cmdc] = startup_cmd;
+		cmdc++;
+	}
+
+	// allocate the memory to store all the pids of the startup processes
+	startup_pids = malloc(sizeof(pid_t) * cmdc);
+
+	// start all the processes
+	for (int i = 0; i < cmdc; i++) {
+		const char* cmd = startup_cmds[i];
+
 		int piperw[2];
 		pipe(piperw);
 		startup_pid = fork();
@@ -1824,12 +1842,14 @@ run(char *startup_cmd)
 		if (startup_pid == 0) {
 			dup2(piperw[0], STDIN_FILENO);
 			close(piperw[1]);
-			execl("/bin/sh", "/bin/sh", "-c", startup_cmd, NULL);
+			execl("/bin/sh", "/bin/sh", "-c", cmd, NULL);
 			EBARF("startup: execl");
 		}
+		startup_pids[i] = startup_pid;
 		dup2(piperw[1], STDOUT_FILENO);
 		close(piperw[0]);
 	}
+
 	/* If nobody is reading the status output, don't terminate */
 	signal(SIGPIPE, SIG_IGN);
 	printstatus();
@@ -1856,9 +1876,10 @@ run(char *startup_cmd)
 	 * frame events at the refresh rate, and so on. */
 	wl_display_run(dpy);
 
-	if (startup_cmd) {
-		kill(startup_pid, SIGTERM);
-		waitpid(startup_pid, NULL, 0);
+	// terminate all the startup processes
+	for (int i = 0; i < cmdc; i++) {
+		kill(startup_pids[i], SIGTERM);
+		waitpid(startup_pids[i], NULL, 0);
 	}
 }
 
