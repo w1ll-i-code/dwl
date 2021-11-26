@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=dwl
+Comment=a compact, hackable compositor for Wayland
+Exec=dwl
+Type=Application

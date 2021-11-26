@@ -16,6 +16,8 @@ clean:
 
 install: dwl
 	install -D dwl $(PREFIX)/bin/dwl
+	install -D dwl.desktop /usr/share/wayland-sessions/dwl.desktop
+	install -d LICENSE LICENSE.dwm LICENSE.tinywl /usr/share/licenses/dwl/
 
 uninstall:
 	rm -f $(PREFIX)/bin/dwl
